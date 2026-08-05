@@ -138,10 +138,12 @@ struct CaptureRegistration {
 };
 
 // State returned after allocator capture bookkeeping has ended. Expected
-// validation errors are reported only after CUDAGraph has restored its
-// registry and pool-routing state.
+// validation errors and fallible deferred cleanup are handled only after
+// CUDAGraph has restored its registry and pool-routing state.
 struct CaptureEndResult {
+  MempoolId_t mempool_id;
   size_t invalid_capture_free_count{0};
+  bool needs_deferred_block_cleanup{false};
 };
 
 class CUDAAllocator : public DeviceAllocator {
@@ -471,6 +473,9 @@ C10_CUDA_API void markCaptureBegin(
     const CaptureRegistration& registration);
 C10_CUDA_API CaptureEndResult
 markCaptureEnd(c10::DeviceIndex device, CaptureId_t capture_id);
+C10_CUDA_API void cleanupDeferredBlocksAfterCapture(
+    c10::DeviceIndex device,
+    const CaptureEndResult& result);
 
 inline void recordHistory(
     bool enabled,

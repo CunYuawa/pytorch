@@ -245,6 +245,8 @@ void CUDAGraph::capture_end_pre() {
   TORCH_CHECK(
       capture_was_registered, "capture_end() called before capture_begin().");
   AT_CUDA_CHECK(endCaptureErr);
+  c10::cuda::CUDACachingAllocator::cleanupDeferredBlocksAfterCapture(
+      capture_dev_, capture_end_result);
   // An invalid conditional free makes the captured graph unsafe to replay.
   // Destroy the template before reporting the delayed validation error.
   if (capture_end_result.invalid_capture_free_count != 0 && graph_ != nullptr) {
@@ -500,8 +502,6 @@ void CUDAGraph::begin_capture_to_conditional_node(
   TORCH_CHECK(
       !has_graph_exec_,
       "This CUDAGraph instance already owns a captured graph.");
-
-  TORCH_CHECK(!c10::cuda::CUDACachingAllocator::CUDAAllocatorConfig::graph_capture_record_stream_reuse(), "'graph_capture_record_stream_reuse:True' allocator config does not work with conditional control flow in a cuda graph today. See issue #175001 for updates");
 
   const CUDAStream parent_dependency_stream = getCurrentCUDAStream();
   cudaStreamCaptureStatus status{};

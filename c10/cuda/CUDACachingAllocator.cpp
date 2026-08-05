@@ -1463,9 +1463,10 @@ class DeviceCachingAllocator {
   //     ends.
   ska::flat_hash_map<Block*, std::vector<cudaGraphNode_t>> deferred_blocks;
 
-  // Allocator bookkeeping for one CUDA capture ID. Capture states remain until
-  // the root capture ends so allocation-lifetime checks can recognize blocks
-  // allocated in an already-ended conditional child capture.
+  // Allocator bookkeeping for one CUDA capture ID. A conditional child
+  // capture inherits the block-reuse stream associated with its parent
+  // dependency stream while retaining its own primary capture stream for
+  // CUDA graph queries.
   struct CaptureState {
     MempoolId_t mempool_id;
     cudaStream_t primary_capture_stream;
@@ -1476,18 +1477,20 @@ class DeviceCachingAllocator {
     size_t invalid_capture_free_count{0};
   };
 
+  // Capture states remain until the root capture ends so allocation-lifetime
+  // checks can recognize blocks allocated in an already-ended conditional
+  // child capture.
   ska::flat_hash_map<CaptureId_t, CaptureState> capture_states;
   ska::flat_hash_map<Block*, CaptureId_t> block_allocation_capture_ids;
 
-  // Incremental reverse-traversal state cached per graph.
+  // Incremental CUDA graph reverse-traversal state cached per capture.
   // We never re-traverse nodes we've already seen
-  struct GraphReuseContext {
+  struct CaptureReachabilityState {
     ska::flat_hash_map<cudaStream_t, ska::flat_hash_set<cudaGraphNode_t>>
-        visited;
+        terminal_predecessors;
   };
-  ska::flat_hash_map<MempoolId_t, CaptureId_t, MempoolIdHash>
-      mempool_to_capture_id;
-  ska::flat_hash_map<CaptureId_t, GraphReuseContext> graph_reuse_context;
+  ska::flat_hash_map<CaptureId_t, CaptureReachabilityState>
+      capture_reachability_states;
 
   // outstanding cuda events
   ska::flat_hash_map<
@@ -1792,7 +1795,7 @@ class DeviceCachingAllocator {
     } else {
       if (CUDAAllocatorConfig::graph_capture_record_stream_reuse()) {
         // We check if there is some block that is safe to reuse on this stream
-        free_safe_blocks_in_capture(context, stream);
+        reclaim_reusable_blocks_during_capture(context, stream);
       }
     }
   }
@@ -2283,7 +2286,9 @@ class DeviceCachingAllocator {
     cudaStreamCaptureStatus status{cudaStreamCaptureStatusNone};
   };
 
-  CaptureInfo stream_get_capture_info(cudaStream_t stream) const {
+  CaptureInfo stream_get_capture_info(
+      cudaStream_t stream,
+      bool allow_invalidated = false) const {
     CaptureInfo info{};
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
     C10_CUDA_CHECK(cudaStreamGetCaptureInfo(
@@ -2304,7 +2309,7 @@ class DeviceCachingAllocator {
         &info.num_terminals));
 #endif
     TORCH_INTERNAL_ASSERT(
-        info.status != cudaStreamCaptureStatusInvalidated,
+        allow_invalidated || info.status != cudaStreamCaptureStatusInvalidated,
         "Invalid stream capture status");
 
     return info;
@@ -2321,24 +2326,26 @@ class DeviceCachingAllocator {
     cudaGraph_t owning_graph = nullptr;
 
     auto try_record = [&](cudaStream_t s) -> bool {
-      auto info = stream_get_capture_info(s);
-      if (info.status == cudaStreamCaptureStatusNone) {
-        return false; // not capturing on this stream -> must defer
+      auto info = stream_get_capture_info(s, /*allow_invalidated=*/true);
+      if (info.status != cudaStreamCaptureStatusActive) {
+        return false; // not actively capturing on this stream -> must defer
       }
 
       if (owning_graph == nullptr) {
         owning_graph = info.graph;
       }
-      TORCH_INTERNAL_ASSERT(
-          info.graph == owning_graph,
-          "All streams in the same capture should agree on the graph");
+      if (info.graph != owning_graph) {
+        // Child and parent graph nodes belong to distinct DAGs. Their marker
+        // reachability cannot be compared directly, so conservatively defer
+        // this block until the enclosing root capture ends.
+        return false;
+      }
 
       // Use current terminals as the free markers for the stream
       for (size_t i = 0; i < info.num_terminals; ++i) {
         auto terminal = info.terminals[i];
         markers.insert(terminal);
       }
-      owning_graph = info.graph; // all streams in the same capture should agree
       return true;
     };
 
@@ -2364,9 +2371,9 @@ class DeviceCachingAllocator {
   // predecessor of every terminal node.
   // This ensures that all future captured work will occur after the free
   // marker, making it safe to reuse.
-  void update_visited(
+  void update_terminal_predecessors(
       const CaptureInfo& info,
-      ska::flat_hash_set<cudaGraphNode_t>& visited) {
+      ska::flat_hash_set<cudaGraphNode_t>& terminal_predecessors) {
     // This is the versioned cudaGraphNodeGetDependencies helper function.
     auto node_get_dependencies =
         [](cudaGraphNode_t n, cudaGraphNode_t* deps, size_t* count) -> void {
@@ -2411,10 +2418,10 @@ class DeviceCachingAllocator {
       auto v = dfs.back();
       dfs.pop_back();
 
-      if (visited.count(v)) {
+      if (terminal_predecessors.count(v)) {
         continue;
       }
-      visited.insert(v);
+      terminal_predecessors.insert(v);
 
       auto parents = get_parents(v);
       for (auto p : parents) {
@@ -2433,7 +2440,7 @@ class DeviceCachingAllocator {
   // on every stream, so the block's previous lifetime ends before any new
   // lifetime begins. This check relies solely on the DAG topology and does not
   // require event queries, making it safe to use during capture.
-  void free_safe_blocks_in_capture(
+  void reclaim_reusable_blocks_during_capture(
       const std::shared_ptr<GatheredContext>& context,
       cudaStream_t stream) {
     auto info = stream_get_capture_info(stream);
@@ -2443,43 +2450,31 @@ class DeviceCachingAllocator {
     if (info.status == cudaStreamCaptureStatusNone || info.num_terminals == 0) {
       return;
     }
-    if (graph_reuse_context.find(info.capture_id) ==
-        graph_reuse_context.end()) {
-      bool found = false;
-      // Search allocation_scopes_ in LIFO order.
-      for (auto& [pool_id, scope] : std::views::reverse(allocation_scopes_)) {
-        if (scope(stream)) {
-          auto graph_pool = graph_pools.find(pool_id);
-          TORCH_INTERNAL_ASSERT(
-              graph_pool != graph_pools.end(),
-              "Could not find graph pool for capture.");
-          auto mempool_id = graph_pool->first;
-          graph_reuse_context[info.capture_id] = GraphReuseContext{};
-          mempool_to_capture_id[mempool_id] = info.capture_id;
-          found = true;
-          break;
-        }
-      }
-      TORCH_INTERNAL_ASSERT(
-          found, "Could not find memory pool id for capture.");
-    }
-    auto& graph_context = graph_reuse_context[info.capture_id];
-    auto& visited = graph_context.visited[stream];
-    update_visited(info, visited);
+    auto reachability_it = capture_reachability_states.find(info.capture_id);
+    TORCH_INTERNAL_ASSERT(
+        reachability_it != capture_reachability_states.end(),
+        "Missing reachability state for active capture.");
+    auto& capture_reachability = reachability_it->second;
+    auto& terminal_predecessors =
+        capture_reachability.terminal_predecessors[stream];
+    update_terminal_predecessors(info, terminal_predecessors);
+
+    const cudaStream_t block_reuse_stream =
+        block_reuse_stream_for_conditional_primary(stream);
 
     std::vector<Block*> blocks_to_erase;
     for (auto& [block, markers] : deferred_blocks) {
       // Skip this block if it has no markers, as we defer its freeing until
       // after graph capture. Also skip if the block was not allocated on the
-      // current stream; such blocks will be freed when
-      // free_safe_blocks_in_capture is attempted on that stream.
-      if (markers.empty() || block->stream != stream) {
+      // current reuse stream; such blocks will be reclaimed when this function
+      // is attempted for the corresponding stream.
+      if (markers.empty() || block->stream != block_reuse_stream) {
         continue;
       }
 
       bool is_reusable = true;
       for (auto m : markers) {
-        if (!visited.count(m)) {
+        if (!terminal_predecessors.count(m)) {
           is_reusable = false;
           break;
         }
@@ -3238,68 +3233,47 @@ class DeviceCachingAllocator {
     allocation_scopes_.emplace_back(mempool_id, std::move(filter));
   }
 
+  void cleanup_deferred_blocks_for_pool(
+      MempoolId_t mempool_id,
+      const std::shared_ptr<GatheredContext>& context) {
+    if (deferred_blocks.empty()) {
+      return;
+    }
+    auto pool_it = graph_pools.find(mempool_id);
+    if (pool_it == graph_pools.end()) {
+      return;
+    }
+
+    auto* private_pool = pool_it->second.get();
+    std::vector<Block*> blocks_to_erase;
+    for (auto& [block, markers] : deferred_blocks) {
+      if (block->pool->owner_PrivatePool != private_pool) {
+        continue;
+      }
+
+      // cudaStreamEndCapture would have failed if a stream participating in
+      // the root capture had not joined back. Remove only uses introduced by
+      // capture, then preserve any pre-capture uses with ordinary events.
+      remove_cudagraph_stream_uses(block);
+      if (block->stream_uses.empty()) {
+        free_block(block, context);
+      } else {
+        insert_events(block);
+        if (block->event_count == 0) {
+          free_block(block, context);
+        }
+      }
+      blocks_to_erase.push_back(block);
+    }
+    for (auto* block : blocks_to_erase) {
+      deferred_blocks.erase(block);
+    }
+  }
+
   // Ends the allocation-routing scope opened by beginAllocateToPool for
   // this mempool_id. See beginAllocateToPool for the full caller list.
   void endAllocateToPool(MempoolId_t mempool_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-
-    if (CUDAAllocatorConfig::graph_capture_record_stream_reuse()) {
-      // Remove stream reuse context and mapping for this capture, if present.
-      if (!graph_reuse_context.empty()) {
-        auto capture_id = mempool_to_capture_id[mempool_id];
-        auto graph_context = graph_reuse_context[capture_id];
-        for (auto& [stream, _] : graph_context.visited) {
-          TORCH_INTERNAL_ASSERT(
-              stream_get_capture_info(stream).status ==
-                  cudaStreamCaptureStatusNone,
-              "This stream should not be capturing when the capture is ended");
-        }
-        graph_reuse_context.erase(capture_id);
-        mempool_to_capture_id.erase(mempool_id);
-      }
-
-      // Free deferred blocks associated with the ended pool, if any.
-      // cudaStreamEndCapture would have failed if any stream used during
-      // capture hadn't been joined back, so all stream uses on these
-      // blocks are known to be complete and we can safely clear them.
-      if (!deferred_blocks.empty()) {
-        auto pool_it = graph_pools.find(mempool_id);
-        if (pool_it != graph_pools.end()) {
-          auto* private_pool = pool_it->second.get();
-          auto context = maybeGatherContext(RecordContext::ALL);
-          std::vector<Block*> blocks_to_erase;
-          for (auto& [block, markers] : deferred_blocks) {
-            if (block->pool->owner_PrivatePool == private_pool) {
-              // At capture end, handle blocks associated with non-capturing
-              // streams. Remove only stream uses introduced during capture
-              // (guaranteed complete), and for any leftover pre-capture uses,
-              // insert events to track their completion. This aligns with
-              // insert_events_deferred_until_no_capture semantics.
-              remove_cudagraph_stream_uses(block);
-              if (block->stream_uses.empty()) {
-                free_block(block, context);
-              } else {
-                // Pre-capture stream uses remain; record events so
-                // process_events can free the block once they complete.
-                insert_events(block);
-                // block->event_count should likely be non-zero here since
-                // block->stream_uses is not empty. Defensive: still free if
-                // event_count is zero, but this should be rare.
-                if (block->event_count == 0) {
-                  free_block(block, context);
-                }
-              }
-              // Must erase from deferred_blocks regardless of which branch we
-              // took.
-              blocks_to_erase.push_back(block);
-            }
-          }
-          for (auto* b : blocks_to_erase) {
-            deferred_blocks.erase(b);
-          }
-        }
-      }
-    }
 
     for (auto it = allocation_scopes_.begin(); it != allocation_scopes_.end();
          ++it) {
@@ -3375,13 +3349,15 @@ class DeviceCachingAllocator {
     }
 
     capture_states.emplace(registration.capture_id, capture_state);
+    capture_reachability_states.emplace(
+        registration.capture_id, CaptureReachabilityState{});
     num_active_captures_++;
   }
 
   // Called by CUDAGraph after cudaStreamEndCapture. This only transitions
-  // allocator bookkeeping and returns expected validation work to the caller.
-  // It deliberately does not report user errors while CUDAGraph still has
-  // registry and pool-routing state to restore.
+  // allocator bookkeeping and returns expected validation/cleanup work to the
+  // caller. It deliberately does not report user errors or perform fallible
+  // CUDA cleanup while CUDAGraph still has routing state to restore.
   CaptureEndResult markCaptureEnd(CaptureId_t capture_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     TORCH_INTERNAL_ASSERT(
@@ -3394,6 +3370,7 @@ class DeviceCachingAllocator {
         "markCaptureEnd called for an unknown or inactive capture");
     const CaptureState ended_capture = capture_it->second;
     capture_it->second.is_active = false;
+    capture_reachability_states.erase(capture_id);
     num_active_captures_--;
 
     if (ended_capture.parent_capture_id.has_value()) {
@@ -3420,6 +3397,7 @@ class DeviceCachingAllocator {
       }
       for (auto it = capture_states.begin(); it != capture_states.end();) {
         if (it->second.root_capture_id == capture_id) {
+          capture_reachability_states.erase(it->first);
           it = capture_states.erase(it);
         } else {
           ++it;
@@ -3428,8 +3406,23 @@ class DeviceCachingAllocator {
     }
 
     return {
+        .mempool_id = ended_capture.mempool_id,
         .invalid_capture_free_count = ended_capture.invalid_capture_free_count,
+        .needs_deferred_block_cleanup =
+            !ended_capture.parent_capture_id.has_value() &&
+            CUDAAllocatorConfig::graph_capture_record_stream_reuse(),
     };
+  }
+
+  void cleanupDeferredBlocksAfterCapture(const CaptureEndResult& result) {
+    if (!result.needs_deferred_block_cleanup) {
+      return;
+    }
+
+    // Context collection can invoke Python and must happen outside `mutex`.
+    auto context = maybeGatherContext(RecordContext::ALL);
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    cleanup_deferred_blocks_for_pool(result.mempool_id, context);
   }
 
   // Called by CUDAGraph::reset and MemPool::~MemPool()
@@ -5327,6 +5320,13 @@ class NativeCachingAllocator : public CUDAAllocator {
     return device_allocator[device]->markCaptureEnd(capture_id);
   }
 
+  void cleanupDeferredBlocksAfterCapture(
+      c10::DeviceIndex device,
+      const CaptureEndResult& result) {
+    assertValidDevice(device);
+    device_allocator[device]->cleanupDeferredBlocksAfterCapture(result);
+  }
+
   void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) override {
     assertValidDevice(device);
     device_allocator[device]->releasePool(std::move(mempool_id));
@@ -5579,6 +5579,16 @@ CaptureEndResult markCaptureEnd(
   }
 }
 
+void cleanupDeferredBlocksAfterCapture(
+    c10::DeviceIndex device,
+    const CaptureEndResult& result) {
+  if (result.needs_deferred_block_cleanup) {
+    TORCH_INTERNAL_ASSERT(
+        get() == &Native::allocator,
+        "Deferred capture cleanup is supported only by the native allocator");
+    Native::allocator.cleanupDeferredBlocksAfterCapture(device, result);
+  }
+}
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.
 // NOLINTNEXTLINE(misc-use-internal-linkage)
