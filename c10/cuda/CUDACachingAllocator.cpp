@@ -1463,6 +1463,20 @@ class DeviceCachingAllocator {
   //     ends.
   ska::flat_hash_map<Block*, std::vector<cudaGraphNode_t>> deferred_blocks;
 
+  // Allocator bookkeeping for one CUDA capture ID. Capture states remain until
+  // the root capture ends so allocation-lifetime checks can recognize blocks
+  // allocated in an already-ended conditional child capture.
+  struct CaptureState {
+    MempoolId_t mempool_id;
+    std::optional<CaptureId_t> parent_capture_id;
+    CaptureId_t root_capture_id{0};
+    bool is_active{true};
+    size_t invalid_capture_free_count{0};
+  };
+
+  ska::flat_hash_map<CaptureId_t, CaptureState> capture_states;
+  ska::flat_hash_map<Block*, CaptureId_t> block_allocation_capture_ids;
+
   // Incremental reverse-traversal state cached per graph.
   // We never re-traverse nodes we've already seen
   struct GraphReuseContext {
@@ -1687,6 +1701,60 @@ class DeviceCachingAllocator {
     }
     pool.erase_from_blocks(block);
     return block;
+  }
+
+  // Resolve a stream's active capture state only when it belongs to a capture
+  // registered by CUDAGraph. CUDA assigns the same ID to the primary stream and
+  // every auxiliary stream joined to that capture.
+  auto active_capture_for_stream(cudaStream_t stream) {
+    if (C10_LIKELY(num_active_captures_ == 0)) {
+      return capture_states.end();
+    }
+    auto capture_id = c10::cuda::captureIdMayInitCtx(stream);
+    if (!capture_id.has_value()) {
+      return capture_states.end();
+    }
+    auto capture_it = capture_states.find(capture_id.value());
+    if (capture_it != capture_states.end() && capture_it->second.is_active) {
+      return capture_it;
+    }
+    return capture_states.end();
+  }
+
+  void record_block_allocation_capture(
+      Block* block,
+      cudaStream_t request_stream) {
+    auto capture_it = active_capture_for_stream(request_stream);
+    if (capture_it != capture_states.end()) {
+      block_allocation_capture_ids[block] = capture_it->first;
+    }
+  }
+
+  // A free is valid when the free capture is the allocation capture itself or
+  // one of its ancestors. Walk parent links from the allocation capture toward
+  // the root until the free capture is found.
+  //
+  // Allocation capture  Free capture       Result
+  // root                root               allow
+  // child               same child         allow
+  // child               parent or root     allow
+  // parent or root      child              reject
+  // child A             sibling child B    reject
+  bool is_free_in_allocation_capture_or_ancestor(
+      CaptureId_t allocation_capture_id,
+      CaptureId_t free_capture_id) const {
+    while (true) {
+      if (allocation_capture_id == free_capture_id) {
+        return true;
+      }
+      auto allocation_capture_it = capture_states.find(allocation_capture_id);
+      if (allocation_capture_it == capture_states.end() ||
+          !allocation_capture_it->second.parent_capture_id.has_value()) {
+        return false;
+      }
+      allocation_capture_id =
+          allocation_capture_it->second.parent_capture_id.value();
+    }
   }
 
   void prepare_for_malloc(
@@ -1956,8 +2024,10 @@ class DeviceCachingAllocator {
 
     bool split_remainder = should_split(
         params.block, params.size(), params.is_expandable_segments_active);
-    return alloc_found_block(
+    Block* block = alloc_found_block(
         params, orig_size, std::move(context), split_remainder);
+    record_block_allocation_capture(block, stream);
+    return block;
   }
 
   Block* mallocWithAddress(size_t orig_size, cudaStream_t stream, void* addr) {
@@ -2025,6 +2095,7 @@ class DeviceCachingAllocator {
           prefix_size,
           context,
           true /* always split for prefix */);
+      record_block_allocation_capture(prefix_block, stream);
       requested_source = prefix_block->next;
       // alloc_found_block re-inserts the split remainder into the pool. We have
       // to manually erase the requested_source.
@@ -2044,6 +2115,7 @@ class DeviceCachingAllocator {
         should_split(requested_source, size, is_expandable_segments_active);
     Block* requested_block = alloc_found_block(
         requested_params, orig_size, std::move(context), split_remainder);
+    record_block_allocation_capture(requested_block, stream);
     if (prefix_block) {
       free_locked(prefix_block, nullptr);
     }
@@ -2441,6 +2513,32 @@ class DeviceCachingAllocator {
 
     if (block->size >= AcceleratorAllocatorConfig::max_split_size())
       stats.oversize_allocations.decrease(1);
+
+    // Reject a free performed from a capture that does not enclose the block's
+    // allocation capture. A conditional child capture may have ended before
+    // its block is freed in an enclosing capture, so querying block->stream
+    // cannot recover the allocation's capture ID.
+    if (C10_UNLIKELY(!block_allocation_capture_ids.empty())) {
+      auto block_allocation_capture_it =
+          block_allocation_capture_ids.find(block);
+      if (block_allocation_capture_it != block_allocation_capture_ids.end()) {
+        auto current_stream = c10::cuda::getCurrentCUDAStream(block->device);
+        auto current_capture_it =
+            active_capture_for_stream(current_stream.stream());
+        if (current_capture_it != capture_states.end()) {
+          const CaptureId_t allocation_capture_id =
+              block_allocation_capture_it->second;
+          if (!is_free_in_allocation_capture_or_ancestor(
+                  allocation_capture_id, current_capture_it->first)) {
+            // Storage destruction reaches this path through a non-throwing
+            // deleter. Record the violation here and report it from the
+            // explicit conditional capture-end call instead of throwing.
+            ++current_capture_it->second.invalid_capture_free_count;
+          }
+        }
+        block_allocation_capture_ids.erase(block_allocation_capture_it);
+      }
+    }
 
     // If the block has been used on more than one stream, handle accordingly.
     if (!block->stream_uses.empty()) {
@@ -3203,13 +3301,97 @@ class DeviceCachingAllocator {
     num_active_captures_++;
   }
 
-  // Called by CUDAGraph after cudaStreamEndCapture.
+  // Compatibility path for callers built against the metadata-free hook.
   void markCaptureEnd() {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     TORCH_INTERNAL_ASSERT(
         num_active_captures_ > 0,
         "markCaptureEnd called with no captures in progress");
     num_active_captures_--;
+  }
+
+  void markCaptureBegin(const CaptureRegistration& registration) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_INTERNAL_ASSERT(
+        registration.capture_id != 0,
+        "markCaptureBegin requires a valid capture ID");
+    TORCH_INTERNAL_ASSERT(
+        capture_states.find(registration.capture_id) == capture_states.end(),
+        "Capture ID is already registered");
+
+    CaptureState capture_state{
+        .mempool_id = registration.mempool_id,
+        .parent_capture_id = registration.parent_capture_id,
+        .root_capture_id = registration.capture_id,
+    };
+    if (registration.parent_capture_id.has_value()) {
+      auto parent_it =
+          capture_states.find(registration.parent_capture_id.value());
+      TORCH_INTERNAL_ASSERT(
+          parent_it != capture_states.end() && parent_it->second.is_active,
+          "Conditional capture parent is not active");
+      TORCH_INTERNAL_ASSERT(
+          parent_it->second.mempool_id == registration.mempool_id,
+          "Conditional capture must share its parent's mempool");
+      capture_state.root_capture_id = parent_it->second.root_capture_id;
+    }
+
+    capture_states.emplace(registration.capture_id, capture_state);
+    num_active_captures_++;
+  }
+
+  // Called by CUDAGraph after cudaStreamEndCapture. This only transitions
+  // allocator bookkeeping and returns expected validation work to the caller.
+  // It deliberately does not report user errors while CUDAGraph still has
+  // registry and pool-routing state to restore.
+  CaptureEndResult markCaptureEnd(CaptureId_t capture_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_INTERNAL_ASSERT(
+        num_active_captures_ > 0,
+        "markCaptureEnd called with no captures in progress");
+
+    auto capture_it = capture_states.find(capture_id);
+    TORCH_INTERNAL_ASSERT(
+        capture_it != capture_states.end() && capture_it->second.is_active,
+        "markCaptureEnd called for an unknown or inactive capture");
+    const CaptureState ended_capture = capture_it->second;
+    capture_it->second.is_active = false;
+    num_active_captures_--;
+
+    if (ended_capture.parent_capture_id.has_value()) {
+      auto parent_it =
+          capture_states.find(ended_capture.parent_capture_id.value());
+      TORCH_INTERNAL_ASSERT(
+          parent_it != capture_states.end() && parent_it->second.is_active,
+          "Conditional capture parent is not active");
+      // If the caller catches the child-end error, every enclosing capture is
+      // still unsafe to replay. Carry the violation to the root so its teardown
+      // also rejects the graph.
+      parent_it->second.invalid_capture_free_count +=
+          ended_capture.invalid_capture_free_count;
+    } else {
+      for (auto it = block_allocation_capture_ids.begin();
+           it != block_allocation_capture_ids.end();) {
+        auto allocation_capture_it = capture_states.find(it->second);
+        if (allocation_capture_it != capture_states.end() &&
+            allocation_capture_it->second.root_capture_id == capture_id) {
+          it = block_allocation_capture_ids.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      for (auto it = capture_states.begin(); it != capture_states.end();) {
+        if (it->second.root_capture_id == capture_id) {
+          it = capture_states.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    return {
+        .invalid_capture_free_count = ended_capture.invalid_capture_free_count,
+    };
   }
 
   // Called by CUDAGraph::reset and MemPool::~MemPool()
@@ -5093,6 +5275,20 @@ class NativeCachingAllocator : public CUDAAllocator {
     device_allocator[device]->markCaptureEnd();
   }
 
+  void markCaptureBegin(
+      c10::DeviceIndex device,
+      const CaptureRegistration& registration) {
+    assertValidDevice(device);
+    device_allocator[device]->markCaptureBegin(registration);
+  }
+
+  CaptureEndResult markCaptureEnd(
+      c10::DeviceIndex device,
+      CaptureId_t capture_id) {
+    assertValidDevice(device);
+    return device_allocator[device]->markCaptureEnd(capture_id);
+  }
+
   void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) override {
     assertValidDevice(device);
     device_allocator[device]->releasePool(std::move(mempool_id));
@@ -5321,6 +5517,29 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+void markCaptureBegin(
+    c10::DeviceIndex device,
+    const CaptureRegistration& registration) {
+  auto* current_allocator = get();
+  if (current_allocator == &Native::allocator) {
+    Native::allocator.markCaptureBegin(device, registration);
+  } else {
+    current_allocator->markCaptureBegin(device);
+  }
+}
+
+CaptureEndResult markCaptureEnd(
+    c10::DeviceIndex device,
+    CaptureId_t capture_id) {
+  auto* current_allocator = get();
+  if (current_allocator == &Native::allocator) {
+    return Native::allocator.markCaptureEnd(device, capture_id);
+  } else {
+    current_allocator->markCaptureEnd(device);
+    return {};
+  }
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.
