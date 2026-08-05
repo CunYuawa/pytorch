@@ -1013,6 +1013,88 @@ class AsyncTPTest(MultiProcContinuousTest):
                 f"Expected strides to match: {output_0.stride()} vs {output_1.stride()}"
             )
 
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_fused_matmul_reduce_scatter_addmm_schedule(self) -> None:
+        # 2D input, scatter_dim=0 and sum selects the schedule that accumulates
+        # through addmm's C operand instead of reducing at the end, but only for
+        # two ranks. Both directions of that choice are asserted below, so this
+        # runs whatever world size the suite was launched with.
+        self._init_process()
+
+        M = 64
+        N = 32
+        K = 1024
+        group = dist.group.WORLD
+
+        torch.manual_seed(42 + self.rank)
+        A = torch.rand(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.rand(K, N, device="cuda", dtype=torch.bfloat16)
+
+        expected = _fused_matmul_reduce_scatter_fallback(
+            A, B, "sum", scatter_dim=0, group_name=group.group_name
+        )
+
+        # assert the schedule under test is the one that ran
+        taken = []
+        original = symm_mem.addmm_reduce_scatter_two_ranks
+
+        def spy(*args, **kwargs):
+            taken.append(True)
+            return original(*args, **kwargs)
+
+        symm_mem.addmm_reduce_scatter_two_ranks = spy
+        try:
+            actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                A, B, "sum", scatter_dim=0, group_name=group.group_name
+            )
+        finally:
+            symm_mem.addmm_reduce_scatter_two_ranks = original
+        # the schedule is selected for exactly two ranks and no more
+        self.assertEqual(len(taken), 1 if self.world_size == 2 else 0)
+
+        torch.testing.assert_close(expected, actual, rtol=1e-2, atol=1e-2)
+        self.assertEqual(expected.stride(), actual.stride())
+
+    @skip_if_lt_x_gpu(2)
+    def test_fused_matmul_reduce_scatter_bfloat16_custom_reduce(self) -> None:
+        self._init_process()
+
+        M = 64
+        N = 32
+        K = 1024
+        group = dist.group.WORLD
+        rank = self.rank
+
+        torch.manual_seed(42 + rank)
+        A = torch.rand(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.rand(K, N, device="cuda", dtype=torch.bfloat16)
+
+        output_0 = _fused_matmul_reduce_scatter_fallback(
+            A, B, "avg", scatter_dim=0, group_name=group.group_name
+        )
+        output_1 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+            A, B, "avg", scatter_dim=0, group_name=group.group_name
+        )
+
+        torch.testing.assert_close(output_0, output_1, rtol=1e-2, atol=1e-2)
+        self.assertEqual(output_0.stride(), output_1.stride())
+
+        # The fused reducer is only selected under graph capture, so the eager
+        # call above does not cover it. output_1 already sized the symmetric
+        # memory workspace, which cannot grow during capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output_2 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                A, B, "avg", scatter_dim=0, group_name=group.group_name
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output_0, output_2, rtol=1e-2, atol=1e-2)
+        self.assertEqual(output_0.stride(), output_2.stride())
+
     @skip_if_rocm_multiprocess  # AsyncTP support changed _fused_scaled_matmul_reduce_scatter_fallback API, need more changes
     @skip_if_lt_x_gpu(2)
     @skipUnless(SM89OrLater, "Requires compute capability >= 8.9")
