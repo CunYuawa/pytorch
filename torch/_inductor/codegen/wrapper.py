@@ -1088,6 +1088,7 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
     node: BufferLike
     is_reused: bool = False
     comm_buffer: bool = False
+    never_reuse: bool = False
 
     def __post_init__(self):
         if V.graph.scheduler.current_node is None:
@@ -1095,6 +1096,9 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
         self.scheduler_node_index = V.graph.scheduler.nodes.index(
             V.graph.scheduler.current_node
         )
+        # Record the pin now: plan() runs later, from the outermost graph, where
+        # V.graph.never_reuse_buffers no longer holds this subgraph's names.
+        self.never_reuse = self.node.get_name() in V.graph.never_reuse_buffers
 
     def plan(self, state: MemoryPlanningState) -> MemoryPlanningLine:
         if len(self.node.get_inputs_that_alias_output()) > 0:
@@ -1105,7 +1109,7 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
             raise AssertionError("expected line to not be reused")
         if self.node.get_name() in V.graph.removed_buffers:
             return NullLine(self.wrapper)
-        if self.node.get_name() in V.graph.never_reuse_buffers:
+        if self.never_reuse:
             # Still freed below, just never offered to the reuse pool: freeing
             # only drops this reference, so storage genuinely retained elsewhere
             # (a tensor an effectful op stashed away, an aliasing set_) survives.
