@@ -1920,16 +1920,23 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 )
             self.writelines(shim_fn_codes)
 
+    @staticmethod
+    def _is_inplace_view_kernel(node) -> bool:
+        """An inplace_view kernel's output aliases its input, so we neither
+        declare a handle for it nor free it."""
+        op_overload = getattr(node, "op_overload", None)
+        return (
+            isinstance(op_overload, torch._ops.OpOverload)
+            and torch.Tag.inplace_view in op_overload.tags
+        )
+
     def generate_c_shim_extern_kernel_alloc(
         self, extern_kernel: ir.ExternKernelAlloc, args: list[str]
     ) -> None:
         # registered output buffer name
         name = extern_kernel.name
         output_handle_name = f"{name}_handle"
-        is_inplace = (
-            isinstance(extern_kernel.op_overload, torch._ops.OpOverload)
-            and torch.Tag.inplace_view in extern_kernel.op_overload.tags
-        )
+        is_inplace = self._is_inplace_view_kernel(extern_kernel)
 
         if not is_inplace:
             self.writeline(f"AtenTensorHandle {output_handle_name};")
@@ -2288,6 +2295,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
             ""
             if isinstance(buffer.get_output_spec(), ir.MultiOutputLayout)
             or isinstance(buffer, ir.TMADescriptor)
+            or self._is_inplace_view_kernel(buffer)
             else f"{buffer.get_name()}.reset();"
         )
 
