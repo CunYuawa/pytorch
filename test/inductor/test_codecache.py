@@ -40,6 +40,7 @@ from torch._inductor.codecache import (
     BypassFxGraphCache,
     CacheabilityValidator,
     CacheBase,
+    CppPythonBindingsCodeCache,
     CppWrapperCodeCache,
     CUDACodeCache,
     FxGraphCache,
@@ -87,6 +88,7 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
+    HAS_CPU,
     HAS_GPU,
     HAS_MULTIGPU,
     HAS_TRITON,
@@ -346,6 +348,35 @@ _custom_empty.__name__ = "empty"
 
 
 class TestPyCodeCache(TestCase):
+    def test_cpp_pybinding_uses_fastcall(self):
+        source = "void kernel(float* input, int64_t length) {}"
+
+        with mock.patch.object(
+            CppPythonBindingsCodeCache, "load_async", return_value=lambda: None
+        ) as load_async:
+            CppPythonBindingsCodeCache.load_pybinding_async(
+                ["float*", "int64_t"], source
+            )
+
+        generated_source = load_async.call_args.args[0]
+        self.assertIn("PyObject* const* args", generated_source)
+        self.assertIn("Py_ssize_t nargs", generated_source)
+        self.assertIn("if(nargs != 2)", generated_source)
+        self.assertIn("METH_FASTCALL", generated_source)
+        self.assertNotIn("PyTuple_GET_ITEM(args", generated_source)
+
+    @unittest.skipIf(not HAS_CPU, "requires C++ compiler")
+    def test_cpp_pybinding_fastcall_runtime(self):
+        binding = CppPythonBindingsCodeCache.load_pybinding(
+            ["int64_t"], 'extern "C" void kernel(int64_t value) {}'
+        )
+
+        self.assertIsNone(binding(1))
+        with self.assertRaisesRegex(RuntimeError, "requires 1 args"):
+            binding()
+        with self.assertRaises(TypeError):
+            binding(value=1)
+
     def test_linemaps_empty(self):
         src = """import torch"""
         (key, path) = PyCodeCache.write(src, "")
@@ -503,6 +534,7 @@ class TestPyCodeCache(TestCase):
 
         generated_source = load_async.call_args.args[0]
         self.assertIn("Py_NewRef(Py_None)", generated_source)
+        self.assertNotIn("PyTuple_GET_ITEM(args", generated_source)
 
 
 @instantiate_parametrized_tests
