@@ -2656,6 +2656,20 @@ class TestMPS(TestCaseMPS):
         res_cpu = torch.norm(d_cpu[0, :, :]), torch.norm(d_cpu[1, :, :])
         self.assertEqual(res, res_cpu)
 
+    @parametrize("dtype", [torch.float32, torch.complex64])
+    @parametrize("p", [None, 1, 2, 0.5, float('inf'), float('-inf'), 'fro'])
+    def test_norm_dtype_matches_cpu(self, dtype, p):
+        # torch.norm reroutes strided inputs to linalg.vector_norm; MPS used to
+        # be excluded, which left it on the legacy path with different dtype
+        # handling (complex dtype errored, 'fro' rejected dtype outright).
+        c = torch.randn(4, 4, dtype=dtype)
+        m = c.to("mps")
+        for dim, keepdim in itertools.product([None, 0, [0, 1]], [False, True]):
+            self.assertEqual(
+                torch.norm(m, p=p, dim=dim, keepdim=keepdim, dtype=dtype).cpu(),
+                torch.norm(c, p=p, dim=dim, keepdim=keepdim, dtype=dtype),
+            )
+
     def test_linalg_vector_norm(self):
         x_mps = torch.tensor([0, 0, 0, 2, 3], dtype=torch.float, device="mps")
         x_cpu = x_mps.detach().clone().cpu()
